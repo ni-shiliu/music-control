@@ -409,6 +409,25 @@ class SpotifyProvider(MusicProvider):
             "source":  "spotify_applescript",
         }
 
+    def player_position(self) -> tuple:
+        """返回 (position_seconds, duration_seconds)，失败返回 (0, 0)。"""
+        r = subprocess.run([
+            "osascript",
+            "-e", f'tell application "{self.proc_name}"',
+            "-e", "if it is running then",
+            "-e", "return (player position as string) & \"|\" & (duration of current track as string)",
+            "-e", "end if",
+            "-e", "end tell",
+        ], capture_output=True, text=True)
+        out = r.stdout.strip()
+        if not out:
+            return 0, 0
+        try:
+            pos_s, dur_ms = out.split("|")
+            return float(pos_s.strip()), float(dur_ms.strip()) / 1000
+        except (ValueError, IndexError):
+            return 0, 0
+
 
 # ── 注册表 ────────────────────────────────────────────────────────────────────
 def get_provider(name: str) -> MusicProvider:
