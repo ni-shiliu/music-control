@@ -11,21 +11,29 @@ work session with music — proactively and responsively.
 
 ## Setup
 
-```bash
-# Verify the skill is installed
-ls ~/.claude/skills/music-control/scripts/music_cli.py
-
-# For Spotify: one-time auth (opens browser)
-python3 ~/.claude/skills/music-control/scripts/music_cli.py --provider spotify auth
-```
-
 Requirements: macOS, Python 3.10+, KuGou Music or Spotify desktop app installed.
+
+### Spotify (one-time, optional)
+
+1. Create an app at [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
+   - Add Redirect URI: `http://127.0.0.1:8888/callback`
+2. Save your Client ID:
+
+   ```bash
+   mkdir -p ~/.config/music-cli
+   echo '{"spotify":{"client_id":"YOUR_CLIENT_ID"}}' > ~/.config/music-cli/config.json
+   ```
+
+3. Authorize:
+
+   ```bash
+   python3 ~/.claude/skills/music-control/scripts/music_cli.py --provider spotify auth
+   ```
 
 ## CLI
 
 ```bash
 MUSIC="python3 ~/.claude/skills/music-control/scripts/music_cli.py"
-
 $MUSIC [--provider kugou|spotify] <command>
 ```
 
@@ -75,26 +83,21 @@ $MUSIC [--provider kugou|spotify] <command>
 Multi-song separator: `|||`
 
 ```bash
-# Play multiple songs in queue (auto-advances)
 $MUSIC play-by 逆战 ||| 天下 ||| 这就是爱
-
-# Add songs to queue first
 $MUSIC queue-add 逆战 ||| 天下
-$MUSIC queue-play          # start from queue
-$MUSIC queue-next          # skip to next in queue
-
-# Search with pagination
+$MUSIC queue-play
+$MUSIC queue-next
 $MUSIC search 周杰伦 --page 2
 ```
 
 ## Response Format
 
 ```json
-{"ok": true, "title": "晴天", "artist": "周杰伦", "playing": true}   // status
-{"ok": true, "results": [{"title":"...", "artist":"...", "id":"..."}]} // search
-{"ok": true, "action": "next"}                                         // control
-{"ok": true, "action": "queue_next", "current": 1, "has_next": true}   // queue
-{"ok": false, "error": "no_player", "message": "..."}                 // error
+{"ok": true, "title": "晴天", "artist": "周杰伦", "playing": true}
+{"ok": true, "results": [{"title":"...", "artist":"...", "id":"..."}]}
+{"ok": true, "action": "next"}
+{"ok": true, "action": "queue_next", "current": 1, "has_next": true}
+{"ok": false, "error": "no_player", "message": "..."}
 ```
 
 ## Notes
