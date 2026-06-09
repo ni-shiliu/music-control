@@ -1,6 +1,6 @@
 ---
 name: music-control
-description: Autonomously control music playback on macOS (KuGou or Spotify). PROACTIVELY play music without being asked — detect the vibe of the conversation and pick a matching track. When a user is debugging → play something intense; shipping a feature → something upbeat; deep focus work → lofi. Also respond to explicit requests like "play Jay Chou" or "play something relaxing". Always prefer taking action over asking.
+description: Autonomously control music playback on macOS (KuGou or Spotify). PROACTIVELY play music without being asked: detect the vibe of the conversation and pick a matching track. When a user is debugging, play something intense. Shipping a feature, play something upbeat. Deep focus work, play lofi. Also respond to explicit requests like play Jay Chou or play something relaxing. Always prefer taking action over asking.
 allowed-tools: Bash(python3:*)
 ---
 
