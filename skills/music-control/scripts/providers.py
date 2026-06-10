@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """music-cli provider 抽象层：KuGouProvider / SpotifyProvider。"""
 import os
-import sys
 import json
-import base64
 import hashlib
-import secrets
+import platform
 import subprocess
 import time
+import uuid
 import urllib.request
 import urllib.parse
 from abc import ABC, abstractmethod
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
 # ── MediaRemote 命令常量 ──────────────────────────────────────────────────────
@@ -126,94 +124,6 @@ class KuGouProvider(MusicProvider):
 
 # ── Spotify ───────────────────────────────────────────────────────────────────
 _CFG_PATH  = os.path.expanduser("~/.config/music-cli/config.json")
-_CB_PORT   = 8888
-_CB_PATH   = "/callback"
-_SCOPES    = "user-read-playback-state user-modify-playback-state user-read-currently-playing"
-
-
-def _load_cfg() -> dict:
-    try:
-        with open(_CFG_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-
-
-def _save_cfg(data: dict):
-    os.makedirs(os.path.dirname(_CFG_PATH), exist_ok=True)
-    with open(_CFG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    os.chmod(_CFG_PATH, 0o600)
-
-
-def _client_id() -> str:
-    cid = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
-    return cid or _load_cfg().get("spotify", {}).get("client_id", "").strip()
-
-
-def _token_data() -> dict:
-    return _load_cfg().get("spotify", {}).get("token", {})
-
-
-def _save_token(td: dict):
-    cfg = _load_cfg()
-    cfg.setdefault("spotify", {})["token"] = td
-    _save_cfg(cfg)
-
-
-def _pkce_pair() -> tuple:
-    verifier  = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    return verifier, challenge
-
-
-def _token_request(params: dict) -> dict:
-    body = urllib.parse.urlencode(params).encode()
-    req  = urllib.request.Request(
-        "https://accounts.spotify.com/api/token", data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urllib.request.urlopen(req, timeout=10) as r:
-        return json.loads(r.read().decode())
-
-
-class _CBHandler(BaseHTTPRequestHandler):
-    code = None
-    error = None
-
-    def do_GET(self):
-        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        if "code" in qs:
-            _CBHandler.code = qs["code"][0]
-            body = b"<h2>Authorization successful! You can close this tab.</h2>"
-        else:
-            _CBHandler.error = qs.get("error", ["unknown"])[0]
-            body = b"<h2>Authorization failed. Please retry.</h2>"
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_):
-        pass
-
-
-def _wait_callback(timeout: int = 120) -> str:
-    _CBHandler.code = _CBHandler.error = None
-    server = HTTPServer(("127.0.0.1", _CB_PORT), _CBHandler)
-    server.timeout = 1
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        server.handle_request()
-        if _CBHandler.code:
-            server.server_close()
-            return _CBHandler.code
-        if _CBHandler.error:
-            server.server_close()
-            raise RuntimeError(f"Spotify 拒绝授权: {_CBHandler.error}")
-    server.server_close()
-    raise TimeoutError("等待授权超时（120 秒），请重试")
-
 
 _SP_VERBS = {
     MR_CMD_NEXT:   "next track",
@@ -223,95 +133,295 @@ _SP_VERBS = {
     MR_CMD_PAUSE:  "pause",
 }
 
+# ── 匿名 Token（Web Player API，无需 OAuth）─────────────────────────────────────
+_ANON_TOKEN_CACHE = {}
+
+_WEB_PLAYER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
+)
+
+# ── Spotify TOTP（从 web-player JS 逆向）────────────────────────────────────
+_SP_TOTP_SECRETS = [
+    {'raw': ',7/*F("rLJ2oxaKL^f+E1xvP@N', 'version': 61},
+    {'raw': 'OmE{ZA.J^":0FG\\Uz?[@WW',    'version': 60},
+    {'raw': '{iOFn;4}<1PFYKPV?5{%u14]M>/V0hDH', 'version': 59},
+]
+
+
+def _sp_totp_key(raw: str) -> bytes:
+    xored = [ord(c) ^ (i % 33 + 9) for i, c in enumerate(raw)]
+    return "".join(str(x) for x in xored).encode('utf-8')
+
+
+def _sp_totp(raw: str, t_ms: int = None) -> int:
+    import hmac as _hmac, hashlib as _hashlib, struct as _struct
+    if t_ms is None:
+        t_ms = int(time.time() * 1000)
+    key = _sp_totp_key(raw)
+    msg = _struct.pack('>Q', t_ms // 30000)
+    h = _hmac.new(key, msg, _hashlib.sha1).digest()
+    offset = h[-1] & 0x0F
+    code = _struct.unpack('>I', h[offset:offset+4])[0] & 0x7FFFFFFF
+    return code % 1_000_000
+
+
+def _fetch_client_token(client_id: str = "d8a5ed958d274c2e8ee717e6a4b0971d") -> dict:
+    device_id = str(uuid.uuid4())
+    body = json.dumps({
+        "client_data": {
+            "client_version": "1.2.92.139.gabc3400e",
+            "client_id": client_id,
+            "js_sdk_data": {
+                "device_brand": "Apple",
+                "device_model": "unknown",
+                "os": "macos",
+                "os_version": platform.mac_ver()[0] or "15.0",
+                "device_id": device_id,
+                "device_type": "computer",
+            },
+        },
+    }).encode()
+    req = urllib.request.Request(
+        "https://clienttoken.spotify.com/v1/clienttoken",
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://open.spotify.com",
+            "User-Agent": _WEB_PLAYER_UA,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return json.loads(r.read().decode())
+
+
+def _fetch_anon_token() -> dict:
+    sp_t = str(uuid.uuid4())
+    now_ms = int(time.time() * 1000)
+    for entry in _SP_TOTP_SECRETS:
+        tv = _sp_totp(entry['raw'], now_ms)
+        ver = entry['version']
+        url = (
+            "https://open.spotify.com/api/token"
+            f"?reason=init&productType=web-player"
+            f"&totp={tv}&totpServer={tv}&totpVer={ver}"
+        )
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/json",
+            "Cookie": f"sp_t={sp_t}; sp_new=1",
+            "User-Agent": _WEB_PLAYER_UA,
+            "Referer": "https://open.spotify.com/",
+            "Origin": "https://open.spotify.com",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                data = json.loads(r.read().decode())
+            if "accessToken" in data:
+                return data
+        except Exception:
+            continue
+    raise RuntimeError("所有 TOTP 版本均失败")
+
+
+_TOKEN_CACHE_FILE = os.path.join(os.path.dirname(_CFG_PATH), "token_cache.json")
+
+
+def _load_token_cache() -> dict:
+    try:
+        with open(_TOKEN_CACHE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_token_cache(data: dict):
+    try:
+        os.makedirs(os.path.dirname(_TOKEN_CACHE_FILE), exist_ok=True)
+        with open(_TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def _refresh_anon_tokens() -> tuple:
+    client_id = "d8a5ed958d274c2e8ee717e6a4b0971d"
+    now = time.time()
+
+    data = _fetch_anon_token()
+    access_token = data.get("accessToken", "")
+    expires_ms = data.get("accessTokenExpirationTimestampMs", 0)
+    expires_at = expires_ms / 1000.0 if expires_ms else now + 3500
+    client_id = data.get("clientId", client_id)
+
+    ct_data = _fetch_client_token(client_id)
+    client_token = (
+        ct_data.get("granted_token", {}).get("token", "")
+        or ct_data.get("response", {}).get("granted_token", {}).get("token", "")
+    )
+
+    if not access_token or not client_token:
+        raise RuntimeError("无法获取 Spotify 匿名 token，请检查网络连接")
+
+    cache = {"access_token": access_token, "client_token": client_token, "expires_at": expires_at - 300}
+    _ANON_TOKEN_CACHE.update(cache)
+    _save_token_cache(cache)
+    return access_token, client_token
+
+
+def _ensure_anon_tokens() -> tuple:
+    """返回 (access_token, client_token)，内存 → 文件 → 网络 三级缓存。"""
+    now = time.time()
+
+    if _ANON_TOKEN_CACHE and _ANON_TOKEN_CACHE.get("expires_at", 0) > now + 300:
+        return _ANON_TOKEN_CACHE["access_token"], _ANON_TOKEN_CACHE["client_token"]
+
+    fc = _load_token_cache()
+    if fc and fc.get("expires_at", 0) > now + 300:
+        _ANON_TOKEN_CACHE.update(fc)
+        return fc["access_token"], fc["client_token"]
+
+    return _refresh_anon_tokens()
+
+
+def _parse_search_results(data: dict) -> list:
+    sv = data.get("data", {}).get("searchV2", {})
+    results = []
+
+    top_items = sv.get("topResults", {}).get("itemsV2", [])
+    for wrapper in top_items:
+        item = (
+            wrapper.get("item", {}).get("data", {})
+            or wrapper.get("data", {})
+        )
+        if item.get("__typename") != "Track":
+            continue
+        track = _extract_track(item)
+        if track:
+            results.append(track)
+
+    track_items = sv.get("tracksV2", {}).get("items", [])
+    for wrapper in track_items:
+        item = (
+            wrapper.get("item", {}).get("data", {})
+            or wrapper.get("data", {})
+        )
+        track = _extract_track(item)
+        if track:
+            results.append(track)
+
+    return results
+
+
+def _extract_track(item: dict) -> Optional[dict]:
+    uri = item.get("uri", "")
+    if not uri or not item.get("name"):
+        return None
+    artists = [a.get("profile", {}).get("name", "") for a in item.get("artists", {}).get("items", [])]
+    artist = artists[0] if artists else ""
+    album = item.get("albumOfTrack", {}) or {}
+    album_name = album.get("name", "")
+    duration_ms = int(
+        (item.get("duration") or item.get("trackDuration") or {}).get("totalMilliseconds", 0)
+    )
+    return {
+        "title":    item.get("name", ""),
+        "artist":   artist,
+        "album":    album_name,
+        "id":       uri,
+        "duration": duration_ms // 1000,
+    }
+
 
 class SpotifyProvider(MusicProvider):
     name = "spotify"
     proc_name = "Spotify"
 
     def __init__(self):
-        self._access_token = ""
-        self._token_expiry = 0.0
-        self._focus_app    = "iTerm2"
+        self._focus_app = "iTerm2"
 
-    # ── 授权 ─────────────────────────────────────────────────────────────────
-    def auth_login(self) -> bool:
-        cid = _client_id()
-        if not cid:
-            print('错误：未配置 client_id，请在 ~/.config/music-cli/config.json 设置：\n'
-                  '  {"spotify": {"client_id": "YOUR_ID"}}', file=sys.stderr)
-            return False
-
-        verifier, challenge = _pkce_pair()
-        redirect = f"http://127.0.0.1:{_CB_PORT}{_CB_PATH}"
-        params = urllib.parse.urlencode({
-            "client_id": cid, "response_type": "code",
-            "redirect_uri": redirect, "scope": _SCOPES,
-            "code_challenge_method": "S256", "code_challenge": challenge,
-        })
-        url = f"https://accounts.spotify.com/authorize?{params}"
-        print(f"正在打开浏览器授权 Spotify…\n{url}")
-        subprocess.run(["open", url])
-        print("等待授权回调（最长 120 秒）…")
-
-        try:
-            code = _wait_callback()
-            data = _token_request({
-                "grant_type": "authorization_code", "code": code,
-                "redirect_uri": redirect, "client_id": cid, "code_verifier": verifier,
-            })
-        except Exception as e:
-            print(f"授权失败：{e}", file=sys.stderr)
-            return False
-
-        _save_token({
-            "access_token":  data["access_token"],
-            "refresh_token": data["refresh_token"],
-            "expires_at":    int(time.time()) + int(data.get("expires_in", 3600)),
-        })
-        print("✓ 授权成功，token 已保存到 ~/.config/music-cli/config.json")
-        return True
-
-    # ── Token ────────────────────────────────────────────────────────────────
-    def _get_token(self) -> str:
-        if self._access_token and time.time() < self._token_expiry - 30:
-            return self._access_token
-        td = _token_data()
-        if not td:
-            return ""
-        if time.time() < td.get("expires_at", 0) - 30:
-            self._access_token = td["access_token"]
-            self._token_expiry = td["expires_at"]
-            return self._access_token
-        # 刷新
-        cid = _client_id()
-        rt  = td.get("refresh_token", "")
-        if not cid or not rt:
-            return ""
-        try:
-            data = _token_request({
-                "grant_type": "refresh_token", "refresh_token": rt, "client_id": cid,
-            })
-            new_td = {
-                "access_token":  data["access_token"],
-                "refresh_token": data.get("refresh_token", rt),
-                "expires_at":    int(time.time()) + int(data.get("expires_in", 3600)),
-            }
-            _save_token(new_td)
-            self._access_token = new_td["access_token"]
-            self._token_expiry = new_td["expires_at"]
-            return self._access_token
-        except Exception:
-            return ""
-
-    def has_credentials(self) -> bool:
-        return bool(_client_id() and _token_data().get("access_token"))
-
-    # ── 搜索（Spotify Web API，需授权）──────────────────────────────────────
     def search(self, keyword: str, page_size: int = 8, page: int = 1) -> list:
-        token = self._get_token()
+        results = self._search_partner(keyword, page_size, page)
+        if results:
+            return results
+        return self._search_oauth(keyword, page_size)
+
+    def _search_partner(self, keyword: str, page_size: int, page: int = 1) -> list:
+        try:
+            access_token, client_token = _ensure_anon_tokens()
+        except Exception:
+            return []
+
+        offset = (page - 1) * page_size
+        body = json.dumps({
+            "variables": {
+                "searchTerm": keyword,
+                "offset": offset,
+                "limit": page_size,
+                "numberOfTopResults": 5,
+                "includeAudiobooks": True,
+                "includePreReleases": False,
+                "includeAlbumPreReleases": False,
+                "includeAuthors": False,
+                "includeEpisodeContentRatingsV2": False,
+            },
+            "operationName": "searchTracks",
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": (
+                        "59ee4a659c32e9ad894a71308207594a65ba67bb"
+                        "6b632b183abe97303a51fa55"
+                    ),
+                },
+            },
+        }).encode()
+
+        def _do_request(at, ct):
+            r = urllib.request.Request(
+                "https://api-partner.spotify.com/pathfinder/v2/query",
+                data=body,
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Language": "zh-CN",
+                    "App-Platform": "WebPlayer",
+                    "Authorization": f"Bearer {at}",
+                    "Client-Token": ct,
+                    "Content-Type": "application/json;charset=UTF-8",
+                    "Origin": "https://open.spotify.com",
+                    "Referer": "https://open.spotify.com/",
+                    "Spotify-App-Version": "1.2.92.139.gabc3400e",
+                    "User-Agent": _WEB_PLAYER_UA,
+                },
+            )
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                return json.loads(resp.read().decode())
+
+        try:
+            return _parse_search_results(_do_request(access_token, client_token))
+        except urllib.request.HTTPError as e:
+            if e.code in (401, 403):
+                try:
+                    access_token, client_token = _refresh_anon_tokens()
+                    return _parse_search_results(_do_request(access_token, client_token))
+                except Exception:
+                    return []
+            return []
+        except Exception:
+            return []
+
+    def _search_oauth(self, keyword: str, page_size: int) -> list:
+        """通过官方 Web API 搜索（需要 OAuth 授权，作为兜底）。"""
+        try:
+            cfg = json.load(open(_CFG_PATH, encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return []
+        token = cfg.get("spotify", {}).get("token", {}).get("access_token", "")
         if not token:
             return []
-        params = urllib.parse.urlencode({"q": keyword, "type": "track", "limit": page_size})
+        params = urllib.parse.urlencode({
+            "q": keyword, "type": "track", "limit": page_size,
+        })
         req = urllib.request.Request(
             f"https://api.spotify.com/v1/search?{params}",
             headers={"Authorization": f"Bearer {token}"},
@@ -332,9 +442,7 @@ class SpotifyProvider(MusicProvider):
         except Exception:
             return []
 
-    # ── 播放（AppleScript，无需 token）───────────────────────────────────────
     def capture_focus(self):
-        """记住当前前台应用（排除 Spotify），供播放后恢复焦点用。"""
         r = subprocess.run(
             ["osascript", "-e",
              'tell application "System Events"\n'
@@ -348,18 +456,15 @@ class SpotifyProvider(MusicProvider):
             self._focus_app = app
 
     def _ensure_running(self) -> bool:
-        """确保 Spotify 在运行，没有则启动并等待就绪。"""
         r = subprocess.run(["pgrep", "-x", self.proc_name], capture_output=True)
         if r.returncode == 0:
             return True
-        # 启动 Spotify
         subprocess.run(["open", "-a", self.proc_name], capture_output=True)
-        # 等待最多 10 秒直到进程出现
         for _ in range(20):
             time.sleep(0.5)
             r = subprocess.run(["pgrep", "-x", self.proc_name], capture_output=True)
             if r.returncode == 0:
-                time.sleep(2)  # 再等 2 秒让 Spotify 完成初始化
+                time.sleep(2)
                 return True
         return False
 
@@ -368,7 +473,6 @@ class SpotifyProvider(MusicProvider):
             return False, ""
         if not self._ensure_running():
             return False, ""
-        # 播放 → 隐藏 Spotify 窗口 → 激活回终端（Spotify 弹出时会短暂闪烁，已是最优）
         script = (
             f'tell application "{self.proc_name}" to play track "{song_id}"\n'
             f'tell application "System Events" to set visible of process "{self.proc_name}" to false\n'
